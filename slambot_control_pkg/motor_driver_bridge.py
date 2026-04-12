@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -15,70 +16,145 @@ class MotorDriverBridge(Node):
     def __init__(self, motor_driver_port):
         super().__init__("motor_driver_bridge")
 
-        self.initial_left_encoder_ticks = None
-        self.initial_right_encoder_ticks = None
-        self.encoder_ticks_delta = 0
-
-        self.maximum_motor_pwm = 255
-        self.left_motor_pwm = self.maximum_motor_pwm
-        self.right_motor_pwm = self.maximum_motor_pwm
-
         self.ser = serial.Serial(motor_driver_port, 115200, timeout=10)
-        self.encoder_ticks_subscriber_ = self.create_subscription(EncoderTicks, "encoder_ticks", self.callback_calculate_encoder_ticks_delta, 10)
-        self.geometry_subscriber = self.create_subscription(Twist, "cmd_vel", self.callback_command_motors, 10)
 
-        self.calculate_correction_timer_ = self.create_timer(0.05, self.calculate_motor_pwm_correction)
-        self.drive_motors_timer = self.create_timer(1.0, self.drive_motors)
+        # Physical robot constants
+        self.wheel_separation = 0.28          # metres
+        self.wheel_radius = 0.03              # metres
+        self.ticks_per_revolution = 1400      # encoder ticks per full wheel revolution
+        self.max_pwm = 255                    # maximum PWM value for motor control
+        
+        # Latest commanded robot motion
+        self.target_linear_x = 0.0
+        self.target_angular_z = 0.0
 
-    def callback_calculate_encoder_ticks_delta(self, msg: EncoderTicks):
-        left_encoder_ticks = msg.left_encoder
-        right_encoder_ticks = msg.right_encoder
+        # Measured wheel speeds in ticks/sec
+        self.measured_left_ticks_per_sec = 0.0
+        self.measured_right_ticks_per_sec = 0.0
 
-        self.get_logger().info(f"left encoder ticks: {left_encoder_ticks}, right encoder ticks: {right_encoder_ticks}")
+        # Target wheel speeds in ticks/sec
+        self.target_left_ticks_per_sec = 0.0
+        self.target_right_ticks_per_sec = 0.0
 
-        if self.initial_left_encoder_ticks is None:
-            self.initial_left_encoder_ticks = left_encoder_ticks
+        # Measured wheel speeds in ticks/sec
+        self.measured_left_ticks_per_sec = 0.0
+        self.measured_right_ticks_per_sec = 0.0
 
-        if self.initial_right_encoder_ticks is None:
-            self.initial_right_encoder_ticks = right_encoder_ticks
+        # Previous encoder readings
+        self.prev_left_ticks = None
+        self.prev_right_ticks = None
 
+        self.prev_control_time = self.get_clock().now()
 
-        left_encoder_ticks_delta = left_encoder_ticks - self.initial_left_encoder_ticks
-        right_encoder_ticks_delta = right_encoder_ticks - self.initial_right_encoder_ticks
+        
+        self.encoder_ticks_subscriber_ = self.create_subscription(EncoderTicks, "encoder_ticks", self.encoder_callback, 10)
+        self.geometry_subscriber = self.create_subscription(Twist, "cmd_vel", self.cmd_vel_callback, 10)
 
-        self.encoder_ticks_delta = left_encoder_ticks_delta - right_encoder_ticks_delta
+        # Control loop timer at 1 Hz
+        self.control_timer = self.create_timer(0.90, self.control_loop)
 
-    def calculate_motor_pwm_correction(self):
-        p = 3.1
-        pwm_correction = abs(int(p * self.encoder_ticks_delta))
+    def cmd_vel_callback(self, msg: Twist):
+        self.target_linear_x = msg.linear.x
+        self.target_angular_z = msg.angular.z
 
-        if self.encoder_ticks_delta > 0: # Veering right 
-            self.left_motor_pwm = max(0, min(255, self.maximum_motor_pwm - pwm_correction))
-            self.right_motor_pwm = self.maximum_motor_pwm
+        left_mps, right_mps = self.twist_to_wheel_linear_speeds(
+            self.target_linear_x,
+            self.target_angular_z,
+            self.wheel_separation,
+        )
 
-        elif self.encoder_ticks_delta < 0: # Veering left
-            self.left_motor_pwm = self.maximum_motor_pwm
-            self.right_motor_pwm = max(0, min(255, self.maximum_motor_pwm - pwm_correction))
+        self.target_left_ticks_per_sec = self.linear_speed_to_ticks_per_sec(
+            left_mps,
+            self.wheel_radius,
+            self.ticks_per_revolution,
+        )
 
-        else:
-            self.left_motor_pwm = self.maximum_motor_pwm
-            self.right_motor_pwm = self.maximum_motor_pwm
+        self.target_right_ticks_per_sec = self.linear_speed_to_ticks_per_sec(
+            right_mps,
+            self.wheel_radius,
+            self.ticks_per_revolution,
+        )
 
-        # self.get_logger().info(f"encoder ticks delta: {self.encoder_ticks_delta}, p: {p}, pwm correction: {pwm_correction}, left motor PWM: {self.left_motor_pwm}, right motor PWM: {self.right_motor_pwm}")
+        self.get_logger().info(f"Target linear x: {self.target_linear_x:.2f} m/s, angular z: {self.target_angular_z:.2f} rad/s")
+        self.get_logger().info(f"Target left ticks/s: {self.target_left_ticks_per_sec:.2f}, Target right ticks/s: {self.target_right_ticks_per_sec:.2f}")
+
+    def encoder_callback(self, msg: EncoderTicks):
+        now = self.get_clock().now()
+
+        if self.prev_left_ticks is None:
+            self.prev_left_ticks = msg.left_encoder
+            self.prev_right_ticks = msg.right_encoder
+            self.prev_control_time = now
+            return
+
+        dt = (now - self.prev_control_time).nanoseconds / 1e9
+        if dt <= 0.0:
+            return
+
+        left_delta = msg.left_encoder - self.prev_left_ticks
+        right_delta = msg.right_encoder - self.prev_right_ticks
+
+        self.measured_left_ticks_per_sec = left_delta / dt
+        self.measured_right_ticks_per_sec = right_delta / dt
+
+        self.prev_left_ticks = msg.left_encoder
+        self.prev_right_ticks = msg.right_encoder
+        self.prev_control_time = now
+
+    def control_loop(self):
+        if self.target_left_ticks_per_sec == 0.0 and self.target_right_ticks_per_sec == 0.0:
+            self.send_motor_command(0, 0)
+            return
+
+        left_motor_error = self.calculate_motor_speed_error(self.target_left_ticks_per_sec, self.measured_left_ticks_per_sec)
+        right_motor_error = self.calculate_motor_speed_error(self.target_right_ticks_per_sec, self.measured_right_ticks_per_sec)
+
+        left_pwm = self.calculate_pwm_from_error(left_motor_error)
+        right_pwm = self.calculate_pwm_from_error(right_motor_error)
+
+        self.send_motor_command(left_pwm, right_pwm)
+
+    def twist_to_wheel_linear_speeds(self, linear_x: float, angular_z: float, wheel_separation: float):
+        left = linear_x - (angular_z * wheel_separation / 2.0)
+        right = linear_x + (angular_z * wheel_separation / 2.0)
+        return left, right
+
+    def linear_speed_to_ticks_per_sec(self, linear_speed: float, wheel_radius: float, ticks_per_revolution: int):
+        wheel_revs_per_sec = linear_speed / (2.0 * math.pi * wheel_radius)
+        return wheel_revs_per_sec * ticks_per_revolution
     
-    def callback_command_motors(self, msg: Twist):
-        self.maximum_motor_pwm = int(msg.linear.x * 255)
+    def calculate_motor_speed_error(self, target_ticks_per_sec: float, measured_ticks_per_sec: float):
+        return target_ticks_per_sec - measured_ticks_per_sec
+    
+    def calculate_pwm_from_error(self, error: float):
+        # Simple proportional controller for demonstration
+        Kp = 3.9  # Proportional gain, needs tuning
+        pwm = Kp * error
 
-    def drive_motors(self):
-        if self.maximum_motor_pwm > 0:
-            left_motor = self.left_motor_pwm
-            right_motor = self.right_motor_pwm
-        else:
-            left_motor = 0
-            right_motor = 0
+        # Clamp PWM to max limits
+        pwm = max(min(pwm, self.max_pwm), -self.max_pwm)
+        return int(pwm)
+    
+    def send_motor_command(self, left_motor_pwm: int, right_motor_pwm: int):
+        left_dir = 1
+        right_dir = 1
 
-        command = f"V{left_motor}:1,{right_motor}:1\n"
+        if left_motor_pwm < 0:
+            left_dir = 0
+            left_motor_pwm = abs(left_motor_pwm)
+
+        if right_motor_pwm < 0:
+            right_dir = 0
+            right_motor_pwm = abs(right_motor_pwm)
+
+        left_motor_pwm = max(0, min(left_motor_pwm, self.max_pwm))
+        right_motor_pwm = max(0, min(right_motor_pwm, self.max_pwm))
+
+        self.get_logger().info(f"Left PWM: {left_motor_pwm} dir={left_dir}, Right PWM: {right_motor_pwm} dir={right_dir}")
+
+        command = f"V{left_motor_pwm}:{left_dir},{right_motor_pwm}:{right_dir}\n"
         self.ser.write(command.encode('utf-8'))
+        self.get_logger().info(f"Sent motor command: {command.strip()}")
 
 def main(args=None):
     parser = argparse.ArgumentParser(description='MotorDriverBridge')
