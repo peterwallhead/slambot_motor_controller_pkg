@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'slambot_control_pkg'
+package_name = 'slambot_motor_controller_pkg'
 
 setup(
     name=package_name,
@@ -20,8 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'motor_driver_bridge = slambot_control_pkg.motor_driver_bridge:main',
-            'velocity_driver = slambot_control_pkg.velocity_driver:main'
+            'motor_driver_bridge = slambot_motor_controller_pkg.motor_driver_bridge:main',
         ],
     },
 )
